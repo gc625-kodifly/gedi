@@ -3,9 +3,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchgeometry as tgm
 import numpy as np
-import open3d.ml.torch as ml3d
+# import open3d.ml.torch as ml3d
 from backbones.pointnet2_ops_lib.pointnet2_ops.pointnet2_modules import PointnetSAModule
-
+from time import time
 
 class tnet(nn.Module):
 
@@ -158,7 +158,7 @@ class LRF(nn.Module):
         x = xp - xpi  # pi->p = p - pi
         xxt = torch.bmm(x, x.transpose(1, 2)) / c
 
-        _, _, v = torch.svd(xxt.to(self.device))
+        _, _, v = torch.linalg.svd(xxt.to(self.device))
         v = v.to(self.device)
 
         with torch.no_grad():
@@ -227,16 +227,91 @@ class GeDi:
         self.gedi_net.load_state_dict(torch.load(config['fchkpt_gedi_net'])['pnet_model_state_dict'])
         self.gedi_net.cuda().eval()
 
+    def radius_search(self, points, queries, radii, metric='L2', ignore_query_point=False, return_distances=False, normalize_distances=False):
+            # Compute pairwise distances
+            if metric == 'L2':
+                # Squared L2 distance
+                dists = torch.cdist(queries, points, p=2)
+            elif metric == 'L1':
+                # L1 distance
+                dists = torch.cdist(queries, points, p=1)
+            else:
+                raise ValueError("Unsupported metric. Use 'L1' or 'L2'.")
+
+            # Initialize result lists
+            neighbors_index = []
+            neighbors_row_splits = [0]
+            neighbors_distance = []
+
+            # Iterate through each query point
+            for i, (query, radius) in enumerate(zip(queries, radii)):
+                # Get neighbors within the radius
+                within_radius = dists[i] <= radius
+
+                if ignore_query_point:
+                    # Ignore the query point itself if it coincides with a data point
+                    within_radius &= dists[i] > 0
+
+                # Get indices and distances of neighbors
+                indices = torch.nonzero(within_radius).squeeze(1)
+                distances = dists[i, indices]
+
+                if normalize_distances:
+                    distances /= radius
+
+                neighbors_index.append(indices)
+                neighbors_row_splits.append(neighbors_row_splits[-1] + len(indices))
+
+                if return_distances:
+                    neighbors_distance.append(distances)
+
+            # Convert results to Tensors
+            neighbors_index = torch.cat(neighbors_index) if neighbors_index else torch.tensor([], dtype=torch.long)
+            neighbors_row_splits = torch.tensor(neighbors_row_splits, dtype=torch.long)
+            neighbors_distance = torch.cat(neighbors_distance) if return_distances and neighbors_distance else torch.tensor([], dtype=torch.float)
+
+            return neighbors_index.cpu(), neighbors_row_splits.cpu(), neighbors_distance
+    
+    def radius_search_fast(self, points, queries, radius):
+        # Compute pairwise distances
+        dists = torch.cdist(queries, points, p=2)
+
+
+        # Broadcast radii to the shape of dists
+        radii = radius.unsqueeze(1)  # Shape (num_queries, 1)
+
+        # Find neighbors within the radius
+        within_radius = dists <= radii
+
+        # Get indices of neighbors
+        neighbors_index = torch.nonzero(within_radius)
+
+        # Generate neighbors_row_splits
+        neighbors_row_splits = torch.zeros(queries.shape[0] + 1, dtype=torch.long)
+        neighbors_count = within_radius.sum(dim=1)
+        neighbors_row_splits[1:] = torch.cumsum(neighbors_count, dim=0)
+
+        return neighbors_index[:, 1].cpu(), neighbors_row_splits.cpu()
+    
     def compute(self, pts, pcd):
 
         radii = self.r_lrf * torch.ones((len(pts)))
+        radii_cuda = radii.cuda()
 
-        out = ml3d.ops.radius_search(pcd, pts, radii,
-                                     points_row_splits=torch.LongTensor([0, len(pcd)]),
-                                     queries_row_splits=torch.LongTensor([0, len(pts)]))
+        # out = ml3d.ops.radius_search(pcd, pts, radii,
+        #                              points_row_splits=torch.LongTensor([0, len(pcd)]),
+        #                              queries_row_splits=torch.LongTensor([0, len(pts)]))
 
+        pts_cuda = pts.cuda()
+        pcd_cuda = pcd.cuda()
+
+        s = time()
+        out = self.radius_search_fast(pcd_cuda, pts_cuda, radii_cuda)
+        print(f"radius search time {time()-s}")
         pcd_desc = np.empty((len(pts), self.dim))
 
+
+        s = time()
         for b in range(int(np.ceil(len(pts) / self.samples_per_batch))):
 
             i_start = b * self.samples_per_batch
@@ -269,6 +344,8 @@ class GeDi:
 
             pcd_desc[i_start:i_end] = f.cpu().detach().numpy()[:i_end - i_start]
 
+
+        print("rest of compute ",time()-s)
         return pcd_desc
 
 
